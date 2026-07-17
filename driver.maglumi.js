@@ -21,8 +21,12 @@ const replaceCTRL = function(s){
 let ipuQuery = () => console.debug("No HOST->IPU Query interface.");
 
 exports.start = exports.boot = function (port, name, queueFn) {
-  name = name || "ASTM Sysmex";
-  return net.createServer(socket => handleClient(socket, name, queueFn)).listen(port);
+  name = name || "Maglumi_X3";
+  const serv = net.createServer(socket => handleClient(socket, name, queueFn));
+  serv.listen(port, function(e){
+	  console.log(`TCP server ${name}/LIS running port ${port}`);
+  });
+  return serv;
 };
 
 exports.query = async function(device, sampleId){
@@ -66,9 +70,8 @@ function emitHeartbeat(name, state){
   catch{}
 }
 
-
 /* =========================
-   CLIENT HANDLER
+   Maglumi.CLIENT HANDLER
 ========================= */
 function handleClient(socket, name, queueFn){
   let buffer = '', pendingQuery = null, expectedFrame = 1, rawFrame = [];
@@ -275,7 +278,7 @@ async function respondToQuery(socket, sampleId, name, queryFn){
 
 
 /* =========================
-   SYSMEX XN PARSER: ASTM E1394
+   MAGLUMI PARSER: ASTM E1394
 ========================= */
 function template() {
   return {

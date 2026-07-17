@@ -27,7 +27,11 @@ function getPatientDataFromDB(sampleId) {
 
 exports.start = exports.boot = function (port, name, queueFn) {
   name = name || "iFlash";
-  return net.createServer(socket => handleClient(socket, name, queueFn)).listen(port);
+  const serv = net.createServer(socket => handleClient(socket, name, queueFn));
+  serv.listen(port, function(e){
+	  console.log(`TCP server ${name}/LIS running port ${port}`);
+  });
+  return serv;
 };
 
 function handleClient(socket, name, queueFn) {

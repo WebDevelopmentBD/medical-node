@@ -8,8 +8,8 @@ const portArg = process.argv.find((arg) => arg.startsWith('--port='));
 const rawPort = portArg ? portArg.split('=')[1] : process.env.TCP_PORT;
 
 //Check for traffic handle driver
-const deviceDriver = process.argv.find((arg) => arg.startsWith('--driver='));
-const deviceLabel = process.argv.find((arg) => arg.startsWith('--device=')) || "ASTM_K";
+const deviceDriver = process.argv.find((arg) => arg.startsWith('--driver=')).split('=').pop();
+const deviceLabel = process.argv.find((arg) => arg.startsWith('--device=')) || "device=ASTM_K";
 
 
 if( !rawPort || !deviceDriver ){
@@ -24,10 +24,10 @@ const API_BRANCH = branchArg ? branchArg.split('=')[1] : process.env.API_BRANCH
 // Group all required values to validate them in one clean pass
 const requiredEnv = {
   TCP_PORT: parseInt(rawPort, 10),
-  DEVICE_NAME: deviceLabel,
+  DEVICE_NAME: deviceLabel.split('=').pop(),
   API_HOST: process.env.API_HOST,
   API_TOKEN: process.env.API_TOKEN,
-  API_BRANCH:  // Uses the resolved value from argument
+  API_BRANCH: API_BRANCH // Uses the resolved value from argument
 };
 
 //const maglumix3 = require('./maglumix3');
@@ -151,7 +151,7 @@ const devices = [
 ];
 */
 
-const server = DRIVER.boot(requiredEnv.TCP_PORT, requiredEnv.DEVICE_NAME, dbQueue));
+const server = DRIVER.start(requiredEnv.TCP_PORT, requiredEnv.DEVICE_NAME, dbQueue);
 
 DRIVER.monitor.status = (device, info) => {
   // Push to dashboard / Prometheus / DB
@@ -204,12 +204,11 @@ function handleCommand(line){
 
 
 function shutdown(signal) {
-  console.log(`Received ${signal}. Starting graceful shutdown...`);
+  console.log(`${requiredEnv.DEVICE_NAME} Received ${signal}. Starting graceful shutdown...`);
   
   // 1. Stop accepting new HTTP requests
-  DRIVER.close(() => {
-    console.log('HTTP server closed.');
-	server.close();
+  server.close((e) => {
+    console.log('TCP/ASTM server on '+requiredEnv.TCP_PORT+' closed.');
     process.exit(0);
 
     // 2. Safely close database connections
