@@ -24,7 +24,7 @@ exports.start = exports.boot = function (port, name, queueFn) {
   name = name || "Sysmex_XN";
   const serv = net.createServer(socket => handleClient(socket, name, queueFn));
   serv.listen(port, function(e){
-	  console.log(`TCP server ${name} running port ${port}`);
+	  console.log(`TCP server ${name}/LIS running port ${port}`);
   });
   return serv;
 };
