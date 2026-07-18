@@ -43,14 +43,14 @@ const ipList = Object.values(os.networkInterfaces())
 console.log("IP Address(es):", ipList);
 
 const credentials = {
-        token: requiredEnv.API_TOKEN,
-        base_url: "https://" +requiredEnv.API_HOST+ "/legacy/api/log-astm.php",
-        branch_id: requiredEnv.API_BRANCH
+	token: requiredEnv.API_TOKEN,
+	base_url: "https://" +requiredEnv.API_HOST+ "/legacy/api/log-astm.php",
+	branch_id: requiredEnv.API_BRANCH
 };
 
 // Any failed query will Queue to local database, then API Call later.
 const dbQueue = function(deviceName, json){
-        console.log(deviceName, json);
+	console.log(deviceName, json);
 };
 
 const apiQueue = function(deviceName, logs, clientAddress){
@@ -59,7 +59,7 @@ const apiQueue = function(deviceName, logs, clientAddress){
 		.replace('T', ' ')       // separate date & time
 		.replace(/\.\d+Z$/, ''); // drop milliseconds and trailing Z
 
-  return httpCallback(logs, {
+  return httpCallback(logs.join('\n'), {
 		'Content-Type' : 'text/plain', "X-App": deviceName, "X-Total": logs.length,
 		'X-Forwarded-Host' : clientAddress.split(':').pop(), 'X-Time' : timeStamp
 	}).then(resp=>{
