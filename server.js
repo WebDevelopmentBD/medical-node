@@ -46,7 +46,7 @@ const server = http.createServer((req, res) => {
 		});
 		console.log('net/https:', `HTTP Response Code: ${res.statusCode}`);
 	});
-	req.on('error', (error)=> console.error("net/https:", error)});
+	req.on('error', (ex)=> console.error("net/https:", ex));
 	req.write();
 	req.end(()=> console.log("net/https, OK"));
 
