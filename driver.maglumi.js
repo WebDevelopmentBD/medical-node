@@ -231,7 +231,7 @@ function handleClient(socket, name, queueFn){
 
         /* ===== CHECKSUM CHECK (only when device sends a checksum) ===== */
         if (frame.hasChecksum) {
-          var csExpected = calcChecksum(frame.frameNo + frame.payload);
+          var csExpected = calcChecksum(frame.body);
           if (frame.checksum !== csExpected) {
             console.error(`[${name}] CHECKSUM FAIL exp=${csExpected} got=${frame.checksum}`);
             socket.write(CTRL.NAK);
@@ -372,25 +372,30 @@ function extractFrame(raw) {
   }
 
   /* --- Optional checksum ---
-     After ETX/ETB, check whether the next 2 bytes are ASCII hex digits.
-     If not (e.g. the byte is EOT=0x04 or ENQ=0x05), treat as no-checksum.
-     The Maglumi X3 observed in the field sends NO frame number and NO checksum,
-     format:  STX records CR ETX EOT */
+     Manual format: <STX>data<CR><ETX>CS<CR>
+     The checksum CS is exactly 2 uppercase hex chars followed by CR.
+     We require the trailing CR to confirm a real checksum — this prevents
+     false positives when non-checksum bytes (e.g. EOT, ENQ, or frame
+     data from the next transmission) happen to be hex-like. */
   var hasChecksum = false;
   var checksum = '';
   var consumeEnd = termIdx + 1;   /* default: consume up to and including ETX/ETB */
 
-  if (termIdx + 3 <= raw.length) {
+  /* Need 4 bytes after terminator: 2 hex + 1 CR + at least 1 more byte
+     (the CR proves these are a checksum, not random data) */
+  if (termIdx + 4 <= raw.length) {
     var b1 = raw.charCodeAt(termIdx + 1);
     var b2 = raw.charCodeAt(termIdx + 2);
-    if (isHexByte(b1) && isHexByte(b2)) {
+    var b3 = raw.charCodeAt(termIdx + 3);
+    if (isHexByte(b1) && isHexByte(b2) && b3 === 0x0D) {
       hasChecksum = true;
       checksum = raw.substring(termIdx + 1, termIdx + 3).toUpperCase();
-      consumeEnd = termIdx + 3;
+      consumeEnd = termIdx + 3;  /* past ETX + 2 checksum bytes (CR consumed below) */
     }
   }
-  /* If <2 bytes after terminator or non-hex bytes → no checksum.
-     The non-hex byte (e.g. EOT) stays in tcpBuf for Phase 4 to handle. */
+  /* If the 2 bytes after ETX are hex but there is NO trailing CR,
+     they are NOT a checksum — they are likely the start of the next
+     transmission's data.  hasChecksum stays false. */
 
   /* Skip optional trailing CR after checksum or after ETX (no-checksum) */
   if (consumeEnd < raw.length && raw.charCodeAt(consumeEnd) === 0x0D) {
@@ -400,6 +405,7 @@ function extractFrame(raw) {
   return {
     frameNo:    frameNo,
     payload:    payload,
+    body:       body,       /* exact text between STX and ETX (for checksum calc) */
     checksum:   checksum,
     hasChecksum: hasChecksum,
     consumeEnd: consumeEnd
