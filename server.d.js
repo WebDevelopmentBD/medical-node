@@ -5,7 +5,7 @@ const https = require('https'), zlib = require('zlib'), URL = require('url').URL
 //Check for the command-line argument first
 const portArg = process.argv.find((arg) => arg.startsWith('--port='));
 //Fallback to process.env.TCP_PORT if the argument isn't provided
-const rawPort = portArg ? portArg.split('=').pop() : process.env.TCP_PORT;
+const rawPort = portArg ? portArg.split('=')[1] : process.env.TCP_PORT;
 
 //FIX: Safe extraction — was .split('=').pop() which crashes TypeError when --driver= is absent
 const deviceDriverArg = process.argv.find((arg) => arg.startsWith('--driver='));
@@ -21,7 +21,7 @@ if( !rawPort || !deviceDriver ){
 
 const branchArg = process.argv.find((arg) => arg.startsWith('--branch='));
 // Fallback to process.env.API_BRANCH if the CLI argument isn't provided
-const API_BRANCH = branchArg ? branchArg.split('=').pop() : process.env.API_BRANCH
+const API_BRANCH = branchArg ? branchArg.split('=')[1] : process.env.API_BRANCH
 
 // Group all required values to validate them in one clean pass
 const requiredEnv = {
