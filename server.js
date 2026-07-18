@@ -36,25 +36,23 @@ const server = http.createServer((req, res) => {
 	const localAddress = Object.values(require('os').networkInterfaces()).flatMap(iface => iface).map(info => info.address);
 	let responseBody = '', bytesReceived = 0;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-	const req = require('https').request("https://ipinfo.io/ip", (res) => {
-		res.on('data', (chunk) => {
-		  responseBody  += chunk;
-		  bytesReceived += chunk.length;
+	const httpReq = require('https').request("https://ipinfo.io/ip", (resp) => {
+		resp.setEncoding('utf8');
+		resp.on('data', (chunk) => {
+			responseBody  += chunk;
+			bytesReceived += chunk.length;
 		});
-		res.on('end', ()=>{
-		  if(res.statusCode != 200) console.error("Body:", responseBody, res.headers, "Bytes:", bytesReceived);
+		resp.on('end', ()=>{
+		  if(res.statusCode != 200) console.error("Body:", responseBody, resp.headers, "Bytes:", bytesReceived);
+		  res.end(JSON.stringify([localAddress, responseBody.trim()], null, 2));
 		});
-		console.log('net/https:', `HTTP Response Code: ${res.statusCode}`);
+		console.log('net/https:', `HTTP Response Code: ${resp.statusCode}`, `${responseBody}`);
 	});
-	req.on('error', (ex)=> console.error("net/https:", ex));
-	req.write();
-	req.end(()=> console.log("net/https, OK"));
-
-	req.on('finish', ()=>{
-	  //finally
-	  res.end(JSON.stringify([localAddress, responseBody], null, 2));
+	httpReq.on('error', (ex)=>{
+		console.error("net/https:", ex);
+		res.end(JSON.stringify([localAddress, "Remote request fail!"], null, 2));
 	});
-		
+	httpReq.end(()=> console.log("net/https, request sent"));
     return;
   }
 
