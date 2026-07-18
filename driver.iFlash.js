@@ -1,238 +1,201 @@
 'use strict';
 
-const net = require('net'), fs = require('fs');
+/**
+ * YHLO iFlash 3000 ASTM E1394 Driver — Pure Broker Mode
+ *
+ * This driver does NOT parse or process any ASTM records.
+ * It only handles the TCP wire protocol (ENQ/ACK/EOT/STX/ETX),
+ * extracts raw text records from frames, and delivers them as-is
+ * to the monitor.callback and queueFn for shipping to the ERP.
+ *
+ * Frame format (adjust if iFlash uses checksums — check binary log):
+ *   ENQ → ACK → <STX>records<CR>...<CR><ETX> → ACK → EOT
+ *
+ * Each record line is CR-separated (0x0D) inside the frame body.
+ */
 
-const CTRL = {
-  STX: '\x02',
-  ETX: '\x03',
-  EOT: '\x04',
-  ENQ: '\x05',
-  ACK: '\x06',
-  NAK: '\x15',
-  ETB: '\x17',
-  CR:  '\x0D',
-  LF:  '\x0A'
+var net = require('net'), fs = require('fs');
+
+var CTRL = {
+  STX: '\x02', ETX: '\x03', EOT: '\x04',
+  ENQ: '\x05', ACK: '\x06', NAK: '\x15'
 };
 
-// Simulated Database Lookups — Replace this with real DB queries!
-function getPatientDataFromDB(sampleId) {
-  return {
-    patientId: "PAT" + sampleId,
-    name: "Smith^John", 
-    dob: "19850615", // YYYYMMDD format calculates Age automatically on iFlash
-    sex: "M",
-    tests: "^^^TSH\\^^^FT4" // YHLO specific test codes separated by \
-  };
-}
+/* ── Public API ── */
 
-exports.start = exports.boot = function (port, name, queueFn) {
-  name = name || "iFlash";
-  const serv = net.createServer(socket => handleClient(socket, name, queueFn));
-  serv.listen(port, function(e){
-	  console.log(`TCP server ${name}/LIS running port ${port}`);
+exports.start = exports.boot = function(port, name, queueFn) {
+  name = name || 'iFlash_3000';
+  var serv = net.createServer(function(socket) {
+    handleClient(socket, name, queueFn);
+  });
+  serv.listen(port, '0.0.0.0', function() {
+    console.log('TCP server ' + name + '/LIS running port ' + port);
   });
   return serv;
 };
 
+/* Stub: backward-compat for server.d.js */
+exports.query = async function() { return {}; };
+exports.setQueryFn = function() {};
+
+exports.monitor = {
+  status: function(device, info) { console.log('[' + device + '] STATUS', info); },
+  error:  function(device, err)  { console.error('[' + device + ']', err); },
+  heartbeat: function() {}
+};
+
+
+/* ═══════════════════════════════════════════
+   CLIENT HANDLER — pure broker, no parsing
+   ═══════════════════════════════════════════ */
 function handleClient(socket, name, queueFn) {
-  // Accumulator buffer to safely handle TCP stream fragmentation
-  let streamAccumulator = ''; 
-  let astmMessageBlock = '';
 
-  console.log(`[${name}] Connected ${socket.remoteAddress}`);
+  var tcpBuf   = '';    /* reassembly buffer for TCP stream */
+  var records  = [];    /* accumulated raw record lines for current transmission */
+  var logStream = null;
 
-  socket.on('data', data => {
+  /* Persistent binary log (append-only, non-blocking) */
+  try {
+    logStream = fs.createWriteStream(name + '.bin', { flags: 'a' });
+    logStream.on('error', function() { logStream = null; });
+  } catch(e) { logStream = null; }
+
+  console.log('[' + name + '] Connected ' + socket.remoteAddress);
+  exports.monitor.status(name, {
+    event: 'CONNECTED', ts: Date.now(), client: socket.remoteAddress
+  });
+
+  /* ── Deliver accumulated records and reset ── */
+  function flushTransmission() {
+    var lines = records.length ? records.slice() : [];
+    records = [];
+
+    if (!lines.length) return;
+
+    /* Primary delivery: monitor.status callback → apiQueue in server.d.js */
+    exports.monitor.status(name, {
+      event: 'EOT',
+      ts: Date.now(),
+      client: socket.remoteAddress,
+      data: lines
+    });
+
+    /* Secondary delivery: queueFn (db fallback in server.d.js) */
+    if (typeof queueFn === 'function') {
+      queueFn(name, lines);
+    }
+  }
+
+  /* ── Main data handler ── */
+  socket.on('data', function(data) {
     try {
-      const raw = data.toString('binary');
-      fs.appendFileSync(`${name}_raw.log`, raw);
-      streamAccumulator += raw;
+      var raw = data.toString('binary');
+      if (logStream) logStream.write(data);
+      tcpBuf += raw;
 
-      // Processing byte-by-byte or frame-by-frame
-      while (streamAccumulator.length > 0) {
-        
-        // 1. Handle Out-of-Frame Control Characters
-        if (streamAccumulator.startsWith(CTRL.ENQ)) {
-          socket.write(CTRL.ACK);
-          streamAccumulator = streamAccumulator.slice(1);
-          continue;
-        }
+      /* ═══════════════════════════════════════════════
+         PROCESSING ORDER (critical for correctness):
+           1. ACK / NAK  — responses from device to our outbound
+           2. ENQ        — device requests permission to send
+           3. STX frames — extract raw text, accumulate records
+           4. EOT        — finalize current transmission batch
+         ═══════════════════════════════════════════════ */
 
-        if (streamAccumulator.startsWith(CTRL.EOT)) {
-          // Analyzer finished sending its chunk. Parse what we got.
-          const queries = parseASTM(astmMessageBlock);
-          astmMessageBlock = ''; 
-          streamAccumulator = streamAccumulator.slice(1);
+      /* Phase 1: Consume ACK/NAK (device responses to our outbound frames) */
+      while (tcpBuf.indexOf(CTRL.ACK) !== -1) tcpBuf = tcpBuf.replace(CTRL.ACK, '');
+      while (tcpBuf.indexOf(CTRL.NAK) !== -1) tcpBuf = tcpBuf.replace(CTRL.NAK, '');
 
-          // If a query record was captured, initiate the transmission response sequence
-          if (queries.length > 0 && queries[0].query.sampleId) {
-            sendQueryResponse(socket, queries[0].query.sampleId, name);
-          }
-          continue;
-        }
-
-        if (streamAccumulator.startsWith(CTRL.ACK) || streamAccumulator.startsWith(CTRL.NAK)) {
-          // These handle transmissions originating from LIS side (ignored here for brevity)
-          streamAccumulator = streamAccumulator.slice(1);
-          continue;
-        }
-
-        // 2. Handle STX Encapsulated Data Frames
-        if (streamAccumulator.startsWith(CTRL.STX)) {
-          const etxIdx = streamAccumulator.indexOf(CTRL.ETX);
-          const etbIdx = streamAccumulator.indexOf(CTRL.ETB);
-          const endIdx = etxIdx !== -1 ? etxIdx : etbIdx;
-
-          // Frame is incomplete, wait for more data from TCP stream
-          if (endIdx === -1 || streamAccumulator.length < endIdx + 3) {
-            break; 
-          }
-
-          const completeFrame = streamAccumulator.substring(0, endIdx + 3);
-          streamAccumulator = streamAccumulator.slice(endIdx + 3);
-
-          const frame = extractFrame(completeFrame);
-          if (!frame) {
-            socket.write(CTRL.NAK);
-            continue;
-          }
-
-          const expected = calcChecksum(frame.payload);
-          if (expected !== frame.checksum) {
-            console.error(`[${name}] CHECKSUM FAIL exp=${expected} got=${frame.checksum}`);
-            socket.write(CTRL.NAK);
-            continue;
-          }
-
-          // Clean frame frame-handling sequence markers (e.g., "1H|...", "2P|...")
-          const cleanLine = frame.payload.substring(1); 
-          astmMessageBlock += cleanLine; // \r is already preserved at end of frame payload
-          socket.write(CTRL.ACK);
-          continue;
-        }
-
-        // Unhandled garbage characters fallback
-        streamAccumulator = streamAccumulator.slice(1);
+      /* Phase 2: ENQ → reply ACK */
+      while (tcpBuf.indexOf(CTRL.ENQ) !== -1) {
+        tcpBuf = tcpBuf.replace(CTRL.ENQ, '');
+        socket.write(CTRL.ACK);
       }
-    } catch (err) {
-      console.error(`[${name}] DATA ERROR`, err.message);
+
+      /* Phase 3: Extract STX…ETX frames, accumulate raw record lines */
+      while (true) {
+        var stxPos = tcpBuf.indexOf(CTRL.STX);
+        if (stxPos === -1) break;
+
+        if (stxPos > 0) {
+          /* Check if EOT is in the gap → end of previous transmission */
+          var gap = tcpBuf.substring(0, stxPos);
+          if (gap.indexOf(CTRL.EOT) !== -1) {
+            tcpBuf = tcpBuf.replace(CTRL.EOT, '');
+            flushTransmission();
+            continue;
+          }
+          /* Non-protocol bytes before STX — skip them */
+          console.warn('[' + name + '] Skipping ' + stxPos + ' byte(s) before STX');
+          tcpBuf = tcpBuf.substring(stxPos);
+        }
+
+        /* Find matching ETX */
+        var etxIdx = tcpBuf.indexOf(CTRL.ETX, stxPos + 1);
+        if (etxIdx === -1) break;  /* incomplete frame — wait for more data */
+
+        /* Body = everything between STX and ETX (may include optional
+           leading frame number digit 1-7, and CR-separated records) */
+        var body = tcpBuf.substring(stxPos + 1, etxIdx);
+        if (!body.length) {
+          tcpBuf = tcpBuf.substring(etxIdx + 1);
+          continue;
+        }
+
+        /* Strip optional frame number: single digit 1-7 before a
+           record-type letter (H/P/O/R/Q/C/L/M/S) */
+        var ASTM_TYPES = 'HPOQRCLMS';
+        if (body.length >= 2
+            && body.charCodeAt(0) >= 0x31 && body.charCodeAt(0) <= 0x37
+            && ASTM_TYPES.indexOf(body[1]) !== -1) {
+          body = body.substring(1);
+        }
+
+        /* Split body on CR to get individual record lines */
+        var lines = body.split('\r');
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].length > 0) {
+            records.push(lines[i]);
+          }
+        }
+
+        /* Consume the frame from the buffer (past ETX, skip optional CR) */
+        var consumeEnd = etxIdx + 1;
+        if (consumeEnd < tcpBuf.length && tcpBuf.charCodeAt(consumeEnd) === 0x0D) {
+          consumeEnd++;
+        }
+        tcpBuf = tcpBuf.substring(consumeEnd);
+
+        /* ACK the frame */
+        socket.write(CTRL.ACK);
+      }
+
+      /* Phase 4: Trailing EOT → finalize */
+      if (tcpBuf.indexOf(CTRL.EOT) !== -1) {
+        tcpBuf = tcpBuf.replace(CTRL.EOT, '');
+        flushTransmission();
+      }
+
+    } catch(err) {
+      console.error('[' + name + '] DATA ERROR', err.message, 'from:', socket.remoteAddress);
       socket.write(CTRL.NAK);
     }
   });
 
-  socket.on('close', () => console.log(`[${name}] Connection closed`));
-  socket.on('error', err => console.error(`[${name}] SOCKET ERROR`, err.message));
-}
+  socket.on('error', function(err) {
+    console.error('[' + name + '] SOCKET ERROR', err.message, 'from:', socket.remoteAddress);
+    exports.monitor.error(name, {
+      type: 'SOCKET_ERROR', message: err.message, ts: Date.now()
+    });
+  });
 
-/* =========================================
-   BIDIRECTIONAL RESPONSE TRANSMITTER
-========================================= */
-function sendQueryResponse(socket, sampleId, name) {
-  console.log(`[${name}] Processing Query for Sample: ${sampleId}`);
-  const patient = getPatientDataFromDB(sampleId);
+  socket.on('timeout', function() {
+    console.error('[' + name + '] SOCKET Timeout', socket.remoteAddress);
+    socket.end();
+  });
 
-  // Fallback if sample barcode doesn't exist in LIS database
-  if( !patient ){
-    const records = [ "H|\\^&|||LIS||||||P|1|", "L|1|I|" ];
-    writeASTMRecords(socket, records);
-    return;
-  }
-
-  // Construct standard ASTM Records array matching YHLO expectations
-  const records = [
-    `H|\\^&|||LIS||||||P|1|`,
-    `P|1||${patient.patientId}||${patient.name}|||${patient.dob}|${patient.sex}||||||||`,
-    `O|1|${sampleId}||${patient.tests}||||||||||||||||||||F`,
-    `L|1|N`
-  ];
-
-  // Perform half-duplex line negotiation 
-  socket.write(CTRL.ENQ);
-  
-  // Quick absolute sync sleep setup for the engine to deliver lines sequentially
-  let seq = 1;
-  let recordIdx = 0;
-
-  // Note: For a robust engine, build a state machine checking for analyzer ACKs 
-  // before firing subsequent strings. This linear loop acts as a structural baseline:
-  setTimeout(() => {
-    for (let record of records) {
-      const payload = `${seq % 8}${record}`;
-      const checksum = calcChecksum(payload);
-      const frame = `${CTRL.STX}${payload}${CTRL.ETX}${checksum}${CTRL.CR}${CTRL.LF}`;
-      socket.write(frame);
-      seq++;
-    }
-    socket.write(CTRL.EOT);
-    console.log(`[${name}] Sent demographic mapping for ${sampleId}`);
-  }, 300); 
-}
-
-/* =========================================
-   UTILITIES & REWORKED PARSER
-========================================= */
-function calcChecksum(data) {
-  let sum = 0;
-  for (let i = 0; i < data.length; i++) {
-    sum += data.charCodeAt(i);
-  }
-  return (sum & 0xFF).toString(16).toUpperCase().padStart(2, '0');
-}
-
-function extractFrame(frameStr) {
-  const etx = frameStr.indexOf(CTRL.ETX);
-  const etb = frameStr.indexOf(CTRL.ETB);
-  const end = etx !== -1 ? etx : etb;
-  if (end === -1) return null;
-
-  return {
-    payload: frameStr.substring(1, end),
-    checksum: frameStr.substring(end + 1, end + 3)
-  };
-}
-
-function template() {
-  return { header: {}, patient: {}, order: { sampleId: '', testDate: '', comments: [] }, results: [], query: { sampleId: '' } };
-}
-
-function parseASTM(raw) {
-  const messages = [];
-  let current = template();
-  const lines = raw.split('\r'); // Lines inside payload end in \r
-
-  for (const line of lines) {
-    if (!line.includes('|')) continue;
-    const f = line.split('|');
-    const type = f[0].replace(/[^A-Z]/g, '');
-
-    switch (type) {
-      case 'H':
-        current.header = { analyzer: f[4]?.trim(), version: f[12] };
-        break;
-      case 'P':
-        current.patient.id = f[3] || '';
-        current.patient.name = f[5] || '';
-        break;
-      case 'Q':
-        // Parse incoming Query criteria from YHLO 
-        // Typically field 3: ^BARCODE^^^^O or similar
-        const qParts = (f[2] || '').split('^');
-        current.query.sampleId = qParts.find(v => v.trim()) || '';
-        break;
-      case 'O':
-        const parts = (f[2] || f[3] || '').split('^');
-        current.order.sampleId = parts.find(v => v.trim()) || '';
-        break;
-      case 'R':
-        const test = f[2]?.split('^')[4];
-        if (test && f[3]) {
-          current.results.push({ name: test, value: f[3], unit: f[4], flag: f[6] || 'N' });
-        }
-        break;
-      case 'L':
-        messages.push(current);
-        current = template();
-        break;
-    }
-  }
-  return messages;
+  socket.on('close', function() {
+    exports.monitor.status(name, { event: 'DISCONNECTED', ts: Date.now() });
+    console.log('[' + name + '] Connection closed');
+    if (logStream) logStream.end();
+  });
 }
