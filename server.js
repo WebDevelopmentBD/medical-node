@@ -18,16 +18,43 @@ function logEnv(context) {
 const server = http.createServer((req, res) => {
   logEnv(`connection to ${req.url}`);
 
-  if (req.url === '/health') {
+  if (req.url == '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', port: PORT, uptime: process.uptime() }));
     return;
   }
 
-  if (req.url === '/env') {
+  if (req.url == '/env') {
     // TEST/DEBUG ONLY — strip this route for production
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(process.env, null, 2));
+    return;
+  }
+
+  if (req.url == '/net') {
+    // TEST/DEBUG ONLY — strip this route for production
+	const localAddress = Object.values(require('os').networkInterfaces()).flatMap(iface => iface).map(info => info.address);
+	let responseBody = '', bytesReceived = 0;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+	const req = require('https').request("https://ipinfo.io/ip", (res) => {
+		res.on('data', (chunk) => {
+		  responseBody  += chunk;
+		  bytesReceived += chunk.length;
+		});
+		res.on('end', ()=>{
+		  if(res.statusCode != 200) console.error("Body:", responseBody, res.headers, "Bytes:", bytesReceived);
+		});
+		console.log('net/https:', `HTTP Response Code: ${res.statusCode}`);
+	});
+	req.on('error', (error)=> console.error("net/https:", error)});
+	req.write();
+	req.end(()=> console.log("net/https, OK"));
+
+	req.on('finish', ()=>{
+	  //finally
+	  res.end(JSON.stringify([localAddress, responseBody], null, 2));
+	});
+		
     return;
   }
 
