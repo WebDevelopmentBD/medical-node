@@ -1,16 +1,13 @@
 #!/usr/bin/env node
 const net = require('net'), path = require('path'), fs = require('fs'), os = require('os');
-const https = require('https'), zlib = require('zlib'), URL = require('url').URL;
+const https = require('https'), URL = require('url').URL;
+//const zlib = require('zlib');
 
 //Check for the command-line argument first
 const portArg = process.argv.find((arg) => arg.startsWith('--port='));
-//Fallback to process.env.TCP_PORT if the argument isn't provided
-const rawPort = portArg ? portArg.split('=')[1] : process.env.TCP_PORT;
-
-//FIX: Safe extraction — was .split('=').pop() which crashes TypeError when --driver= is absent
+const rawPort = portArg ? portArg.split('=').pop() : process.env.TCP_PORT;
 const deviceDriverArg = process.argv.find((arg) => arg.startsWith('--driver='));
 const deviceDriver = deviceDriverArg ? deviceDriverArg.split('=').pop() : null;
-
 const deviceLabel = process.argv.find((arg) => arg.startsWith('--device=')) || "device=ASTM_K";
 
 
@@ -20,8 +17,7 @@ if( !rawPort || !deviceDriver ){
 }
 
 const branchArg = process.argv.find((arg) => arg.startsWith('--branch='));
-// Fallback to process.env.API_BRANCH if the CLI argument isn't provided
-const API_BRANCH = branchArg ? branchArg.split('=')[1] : process.env.API_BRANCH
+const API_BRANCH = branchArg ? branchArg.split('=').pop() : process.env.API_BRANCH
 
 // Group all required values to validate them in one clean pass
 const requiredEnv = {
@@ -35,13 +31,13 @@ const requiredEnv = {
 const DRIVER = require('./driver.'+deviceDriver+'.js');
 
 //FIX: Wire the query function so driver can respond to Maglumi sample queries
-if (typeof DRIVER.setQueryFn === 'function') {
-  DRIVER.setQueryFn(DRIVER.query);
+if(typeof DRIVER.setQueryFn == 'function') {
+  DRIVER.setQueryFn( DRIVER.query );
 }
 
 const ipList = Object.values(os.networkInterfaces())
   .flatMap(iface => iface)
-  .filter(info => (info.family === 'IPv4' || info.family === 4) && !info.internal)
+  .filter(info => (info.family == 'IPv4' || info.family === 4) && !info.internal)
   .map(info => info.address);
 
 console.log("IP Address(es):", ipList);
@@ -58,42 +54,51 @@ const dbQueue = function(deviceName, json){
 };
 
 const apiQueue = function(deviceName, logs, clientAddress){
-        //FIX: Removed redundant second .replace('Z', '') — already handled by regex
-        const timeStamp = (new Date()).toISOString()
-            .replace('T', ' ')       // separate date & time
-            .replace(/\.\d+Z$/, ''); // drop milliseconds and trailing Z
+  //FIX: Removed redundant second .replace('Z', '') — already handled by regex
+  const timeStamp = (new Date()).toISOString()
+		.replace('T', ' ')       // separate date & time
+		.replace(/\.\d+Z$/, ''); // drop milliseconds and trailing Z
 
-  zlib.gzip(logs.join('\n'), (err, compressedBuffer) => {
-        if(err) return console.error(err.message);
-        httpCallback(compressedBuffer, {
-                'Content-Type' : 'text/x-gzip', "X-App": deviceName, "X-Total": logs.length,
-                'X-Forwarded-Host' : clientAddress, 'X-Time' : timeStamp
-        }).then(resp=>{
-                console.log("apiQueue(gz):", resp.replace(/\r|\n/g, ', ').trim(), "for",logs.length,"rows.");
-        }, ex=>console.error("apiQueue(gz):",ex));
-  });
+  return httpCallback(logs, {
+		'Content-Type' : 'text/plain', "X-App": deviceName, "X-Total": logs.length,
+		'X-Forwarded-Host' : clientAddress.split(':').pop(), 'X-Time' : timeStamp
+	}).then(resp=>{
+		console.log("apiQueue(txt):", resp.replace(/\r|\n/g, ', ').trim(), "for", logs.length, "rows.");
+	}, ex=>console.error("apiQueue(text):",ex));
+
+	/**Compressed stream for save bandwidth
+	  zlib.gzip(logs.join('\n'), (err, compressedBuffer) => {
+		if(err) return console.error(err.message);
+		httpCallback(compressedBuffer, {
+			'Content-Type' : 'text/x-gzip', "X-App": deviceName, "X-Total": logs.length,
+			'X-Forwarded-Host' : clientAddress, 'X-Time' : timeStamp
+		}).then(resp=>{
+			console.log("apiQueue(gz):", resp.replace(/\r|\n/g, ', ').trim(), "for",logs.length,"rows.");
+		}, ex=>console.error("apiQueue(gz):",ex));
+	  });
+	*/
  };
 
 function httpCallback( postData, headerCols ){
-        const cookies = "API=ERPCallback; VER=1.2.0; File="+escape(path.basename(__filename))+"; SOURCE=ASTM";
-        postData = Buffer.from( postData );
+	const cookies = "API=ERPCallback; VER=1.2.0; File="+escape(path.basename(__filename))+"; SOURCE=ASTM";
+	postData = Buffer.from( postData );
 
-        let options = {
+	let options = {
         method: 'PUT',
         headers: {
-                        'Accept': 'text/html,application/json,application/xml;q=0.9,*/*;q=0.8',
-                        'Authorization': `Bearer ${credentials.token}`,
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:1.0) Gecko/20100101 Node/'+process.versions.node,
-                        'Cookie': cookies,
-            'Content-Type': 'text/x-gzip',
-            'Content-Length': postData.length,
-                        'X-App': "MedicalD",
-                        'X-Branch': credentials.branch_id
+			'Accept': 'text/html,application/json,application/xml;q=0.9,*/*;q=0.8',
+			'Authorization': `Bearer ${credentials.token}`,
+			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:1.0) Gecko/20100101 Node/'+process.versions.node,
+			'Cookie': cookies,
+			'Content-Type': 'text/plain',
+			'Content-Length': postData.length,
+			'X-App': "MedicalD",
+			'X-Branch': credentials.branch_id
         }
     };
-        if( headerCols ) for(let col in headerCols) options.headers[col]=headerCols[col];
+	if( headerCols ) for(let col in headerCols) options.headers[col]=headerCols[col];
 
-  return new Promise((resolve, reject) => {
+	  return new Promise((resolve, reject) => {
         let responseBody = '', bytesReceived = 0, endpoint = new URL(credentials.base_url);
 
         const req = https.request(credentials.base_url + "?filename=ASTMLog&source=" + path.basename(__filename), options, (res) => {
@@ -124,10 +129,9 @@ function httpCallback( postData, headerCols ){
 const server = DRIVER.start(requiredEnv.TCP_PORT, requiredEnv.DEVICE_NAME, dbQueue);
 
 DRIVER.monitor.status = (device, info) => {
-  // Push to dashboard / Prometheus / DB
   console.log(`[${device}] STATUS`, info);
   if(info.event == 'EOT' && info.data){
-          apiQueue(device, info.data, info.client);
+	apiQueue(device, info.data, info.client);
   }
 };
 DRIVER.monitor.error = (device, err) => {
@@ -137,45 +141,6 @@ DRIVER.monitor.error = (device, err) => {
 DRIVER.monitor.heartbeat = (device, state) => {
   // Optional
 };
-
-//==Self daemon to receive command from SERVER
-function handleCommand(line){
-  const [cmd, ...args] = line.trim().split(/\s+/);
-  switch (cmd.toUpperCase()) {
-    case 'PING':
-      return 'PONG';
-
-    case 'ECHO':
-      return args.join(' ');
-
-    case 'TIME':
-      return new Date().toISOString();
-
-        //FIX: was `devices.forEach(...)` — `devices` was never defined.
-        //     Now restarts the single driver instance.
-        case 'RELOAD':
-          server.close(() => {
-            const reloaded = DRIVER.start(requiredEnv.TCP_PORT, requiredEnv.DEVICE_NAME, dbQueue);
-            // Note: cannot reassign const `server`; caller should use module ref if needed
-            console.log('[' + requiredEnv.DEVICE_NAME + '] Reloaded on port ' + requiredEnv.TCP_PORT);
-          });
-      return "Reload initiated!";
-
-        // ---------- RESTART ----------
-    case 'RESTART':
-      // optional: give the client a quick ack before we exit
-      setTimeout(() => {
-        // exit cleanly; a supervisor will bring the process back up
-        process.exit(0);
-      }, 100);
-      return 'OK: restarting';
-
-    default:
-      return `ERROR: unknown command "${cmd}"`;
-  }
-}
-// -------------------------------------------------------------------------
-
 
 function shutdown( signal ){
   console.log(`${requiredEnv.DEVICE_NAME} Received ${signal}. Starting graceful shutdown...`);
