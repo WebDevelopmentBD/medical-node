@@ -1,218 +1,63 @@
 'use strict';
 
-const net = require('net'), fs = require('fs');
+/**
+ * Sysmex XN-550 ASTM E1394 Driver — Pure Broker Mode
+ *
+ * Unidirectional: device sends results, LIS delivers raw text to ERP.
+ * No parsing, no CPU-heavy processing.
+ *
+ * Sysmex frame format (WITH checksum, unlike Maglumi X3):
+ *   ENQ → ACK → <STX>frameNo records<CR>...<CR><ETX>CS<CR> → ACK → EOT
+ *
+ * Records are CR-separated (0x0D) inside the frame body.
+ * Frame number (1-7) is a single leading digit before the first record.
+ * Checksum CS is 2 uppercase hex chars after ETX.
+ */
 
-const CTRL = {
-  STX: '\x02',
-  ETX: '\x03',
-  EOT: '\x04',
-  ENQ: '\x05',
-  ACK: '\x06',
-  NAK: '\x15',
-  ETB: '\x17'
+var net = require('net'), fs = require('fs');
+
+var CTRL = {
+  STX: '\x02', ETX: '\x03', EOT: '\x04',
+  ENQ: '\x05', ACK: '\x06', NAK: '\x15', ETB: '\x17'
 };
 
-const escapeChars = ['\x02','\x03','\x04','\x05', '\x06','\x15', '\x17'];
+/* ── Public API ── */
 
-const replaceCTRL = function(s){
-	return String(s).replace(/[\x03\x04]/g, '').replace(/[\x05\x02]/g, '').replace(/[\x06]/g, '');
-};
-
-let ipuQuery = () => console.debug("No HOST->IPU Query interface.");
-
-exports.start = exports.boot = function (port, name, queueFn) {
-  name = name || "Sysmex_XN";
-  const serv = net.createServer(socket => handleClient(socket, name, queueFn));
-  serv.listen(port, '0.0.0.0', function(e){
-	  console.log(`TCP server ${name}/LIS running port ${port}`);
+exports.start = exports.boot = function(port, name, queueFn) {
+  name = name || 'Sysmex_XN';
+  var serv = net.createServer(function(socket) {
+    handleClient(socket, name, queueFn);
+  });
+  serv.listen(port, '0.0.0.0', function() {
+    console.log('TCP server ' + name + '/LIS running port ' + port);
   });
   return serv;
 };
 
-exports.query = async function(device, sampleId){
-  // Fetch from DB / API / cache
-  return {
-    sampleId,
-    tests: ['WBC', 'RBC', 'HGB']
-  };
-};
+/* Stub: backward-compat for server.d.js */
+exports.query = async function() { return {}; };
+exports.setQueryFn = function() {};
 
 exports.monitor = {
-  status: (device, info) =>
-    console.debug(`[STATUS:${device}]`, info),
-
-  error: (device, err) =>
-    console.debug(`[ERROR:${device}]`, err),
-
-  heartbeat: (device, state) =>
-    console.debug(`[HEARTBEAT:${device}]`, state.connected ? 'ALIVE' : 'DOWN')
+  status: function(device, info) { console.log('[' + device + '] STATUS', info); },
+  error:  function(device, err)  { console.error('[' + device + ']', err); },
+  heartbeat: function() {}
 };
 
 
-function emitStatus(name, info){
-  try{
-    exports.monitor?.status(name, info);
-  }
-  catch{}
-}
-
-function emitError(name, err){
-  try{
-    exports.monitor?.error(name, err);
-  }
-  catch{}
-}
-
-function emitHeartbeat(name, state){
-  try{
-    exports.monitor?.heartbeat(name, state);
-  }
-  catch{}
-}
-
-
-/* =========================
-   CLIENT HANDLER
-========================= */
-function handleClient(socket, name, queueFn){
-  let buffer = '', pendingQuery = null, expectedFrame = 1, rawFrame = [];
-  
-  const state = {connected: true, endPoint:socket.remoteAddress, lastDataTs: Date.now(), lastFrameTs: null, lastEotTs: null, errorCount: 0};
-
-  console.log(`[${name}] Connected ${socket.remoteAddress}`);
-  emitStatus(name, { event: 'CONNECTED', ts: Date.now(), client: socket.remoteAddress });
-
-  socket.on('data', data => {
-	state.lastDataTs = Date.now();
-    try {
-      const raw = data.toString('binary');
-      fs.appendFileSync(`${name}.bin`, data);
-
-	  //if(escapeChars.indexOf( data ) < 0)
-	  rawFrame.push(replaceCTRL( data ));
-
-      if(raw.includes( CTRL.ENQ )){
-        socket.write(CTRL.ACK);
-        return;
-      }
-
-	  /* ===== End of Terminator (Finish) ===== */
-      if(raw.includes( CTRL.EOT ) || raw.includes("L|1|N\r")){
-		  state.lastEotTs = Date.now();
-		  emitStatus(name, {event: 'EOT', ts: state.lastEotTs, client: socket.remoteAddress, data: rawFrame.join('').split("\r") });
-		  if(pendingQuery && ipuQuery){
-			respondToQuery(socket, pendingQuery, name, ipuQuery);
-			pendingQuery = null;
-		  }
-		  finalize(buffer, name, queueFn);
-
-		  buffer = '';
-		  rawFrame = [];
-		  expectedFrame = 1;   // RESET HERE
-		  return;
-      }
-
-	  //==Record received for processing
-      if(raw.includes( CTRL.STX )){
-		const frame = extractFrame(raw);
-		if( !frame ){
-			state.errorCount++;
-			socket.write(CTRL.NAK);
-			return;
-		}
-
-		/* ===== FRAME SEQUENCE CHECK ===== */
-		if(frame.frameNo !== expectedFrame){
-			console.error(
-			  `[${name}] FRAME SEQ ERROR exp=${expectedFrame} got=${frame.frameNo} from ${socket.remoteAddress}`
-			);
-			socket.write(CTRL.NAK);
-			state.errorCount++;
-			emitError(name, {type: 'FRAME_ERROR', expected, received, ts: Date.now()});
-			return;
-		}
-
-		/* ===== CHECKSUM CHECK ===== */
-		const expected = calcChecksum(frame.frameNo + frame.payload);
-
-		if(frame.checksum !== expected){
-			console.error(`[${name}] CHECKSUM FAIL exp=${expected} got=${frame.checksum}`);
-			socket.write( CTRL.NAK );
-			let dt = new Date();
-			fs.appendFileSync(`${name}.checksum.log`, `[${socket.remoteAddress}] ${frame.checksum} != ${expected} `, dt.toISOString()+"\n");
-			return;
-		}
-
-		emitHeartbeat(name, state);//Respond
-
-		if(frame.payload.startsWith('Q|')) {
-		  const parts = frame.payload.split('|');
-		  pendingQuery = parts[2]?.replace(/\^/g, '').trim();
-		}
-
-		/* ===== ACCEPT FRAME ===== */
-		buffer += frame.payload.replace(/\x0D\x0A/g, '') + '\r';
-		expectedFrame = nextFrame(expectedFrame);
-		socket.write(CTRL.ACK);
-      }
-
-    }
-	catch(err){
-	  state.errorCount++;
-      console.error(`[${name}] DATA ERROR`, err.message, "from:", socket.remoteAddress);
-      socket.write(CTRL.NAK);
-    }
-  });
-
-  socket.on('error', err => {
-	state.errorCount++;
-    console.error(`[${name}] SOCKET ERROR`, err.message, "from:", socket.remoteAddress);
-	emitError(name, {type: 'TIMEOUT', lastDataTs: state.lastDataTs, ts: Date.now()});
-  });
-  
-  socket.on('timeout', ()=>{
-	state.errorCount++;
-    console.error(`[${name}] SOCKET Timeout`, socket.remoteAddress);
-	socket.end(); // Use end() to initiate a graceful shutdown
-  });
-
-  socket.on('close', ()=>{
-	state.connected = false;
-	emitStatus(name, { event: 'DISCONNECTED', ts: Date.now() });
-	console.log(`[${name}] Connection closed`)
-  });
-}
-
-/* =========================
-   FINALIZE
-========================= */
-function finalize(raw, name, queueFn) {
-  try {
-    const json = parseASTM( raw );
-    if( json.length ){
-      console.log(`[${name}] Queued ${json.length} order(s)`);
-      if(typeof(queueFn) != "undefined") queueFn.call(this, name, json);
-    }
-  }
-  catch( err ){
-    console.error(`[${name}] FINALIZE ERROR`, err);
-  }
-}
-
-
-/* =========================
-   CHECKSUM UTILITIES
-========================= */
+/* ═══════════════════════════════════════════════════════
+   CHECKSUM — SUM mod 256 (observed from Sysmex XN series)
+   ═══════════════════════════════════════════════════════ */
 function calcChecksum(data) {
-  let sum = 0;
-  for (let i = 0; i < data.length; i++)
-  {
+  var sum = 0;
+  for (var i = 0; i < data.length; i++) {
     sum += data.charCodeAt(i);
   }
-  return (sum & 0xFF)
-    .toString(16)
-    .toUpperCase()
-    .padStart(2, '0');
+  return (sum & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+}
+
+function isHexByte(b) {
+  return (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x46) || (b >= 0x61 && b <= 0x66);
 }
 
 function nextFrame(n) {
@@ -220,173 +65,206 @@ function nextFrame(n) {
 }
 
 
-function extractFrame( raw ){
-  const stx = raw.indexOf(CTRL.STX);
-  if (stx === -1) return null;
+/* ═══════════════════════════════════════════
+   CLIENT HANDLER — pure broker, no parsing
+   ═══════════════════════════════════════════ */
+function handleClient(socket, name, queueFn) {
 
-  const etx = raw.indexOf(CTRL.ETX);
-  const etb = raw.indexOf(CTRL.ETB);
-  const end = etx !== -1 ? etx : etb;
-  if (end === -1) return null;
+  var tcpBuf   = '';    /* reassembly buffer for TCP stream */
+  var records  = [];    /* accumulated raw record lines for current transmission */
+  var logStream = null;
+  var expectedFrame = 1;
 
-  const body = raw.substring(stx + 1, end);   // "1H|..."
-  const frameNo = parseInt(body[0], 10);
-
-  if (isNaN(frameNo)) return null;
-
-  const payload = body.substring(1);           // strip frame number
-  const checksum = raw.substring(end + 1, end + 3);
-
-  return { frameNo, payload, checksum };
-}
-
-
-// Talkback to IPU
-async function respondToQuery(socket, sampleId, name, queryFn){
+  /* Persistent binary log (append-only, non-blocking) */
   try {
-    const order = await queryFn(name, sampleId);
-    if (!order) return;
+    logStream = fs.createWriteStream(name + '.bin', { flags: 'a' });
+    logStream.on('error', function() { logStream = null; });
+  } catch(e) { logStream = null; }
 
-    let frame = 1;
-    const records = [];
+  console.log('[' + name + '] Connected ' + socket.remoteAddress);
+  exports.monitor.status(name, {
+    event: 'CONNECTED', ts: Date.now(), client: socket.remoteAddress
+  });
 
-    records.push(`H|\\^&|||LIS|||||||P|1`);
-    records.push(
-      `O|1|${order.sampleId}||${order.tests.map(t => `^^^${t}`).join('\\')}`
-    );
-    records.push(`L|1|N`);
+  /* ── Deliver accumulated records and reset ── */
+  function flushTransmission() {
+    var lines = records.length ? records.slice() : [];
+    records = [];
+    expectedFrame = 1;
 
-    socket.write(CTRL.ENQ);
+    if (!lines.length) return;
 
-    for(const rec of records)
-	{
-      const payload = frame + rec;
-      const cs = calcChecksum(payload);
-      socket.write(
-        CTRL.STX + payload + CTRL.ETX + cs + '\r\n'
-      );
-      frame = nextFrame(frame);
-    }
+    /* Primary delivery: monitor.status callback → apiQueue in server.d.js */
+    exports.monitor.status(name, {
+      event: 'EOT',
+      ts: Date.now(),
+      client: socket.remoteAddress,
+      data: lines
+    });
 
-    socket.write(CTRL.EOT);
-
-    console.log(`[${name}] Sent query response to ${socket.remoteAddress} for ${sampleId}`);
-
-  }catch(err){
-    console.error(`[${name}] QUERY RESPONSE ERROR`, err, 'from', socket.remoteAddress);
-  }
-}
-
-
-/* =========================
-   SYSMEX XN PARSER: ASTM E1394
-========================= */
-function template() {
-  return {
-    header: {},
-    patient: {},
-    order: {
-      sampleId: '',
-      testDate: '',
-      comments: []
-    },
-    results: []
-  };
-}
-
-function parseASTM(raw) {
-
-  const messages = [];
-  let current = template();
-  let lastResult = null;
-
-  const lines = raw.split(/\r\n|\r|\n/);
-
-  for (const line of lines)
-  {
-    if (!line.includes('|')) continue;
-
-    const f = line.split('|');
-    const type = f[0].replace(/[^A-Z]/g, '');
-
-    switch (type)
-	{
-
-      /* ================= HEADER ================= */
-      case 'H':
-        current.header = {
-          analyzer: f[4]?.trim(),
-          version: f[12]
-        };
-        break;
-
-      /* ================= PATIENT ================= */
-      case 'P':
-        current.patient.id = f[3] || '';
-        break;
-
-      /* ================= ORDER ================= */
-      case 'O':
-        const parts = (f[2] || f[3] || '').split('^');
-        current.order.sampleId =
-          parts.find(v => v.trim()) || '';
-        break;
-
-      /* ================= RESULT ================= */
-      case 'R':
-        lastResult = null;
-
-        const test = f[2]?.split('^')[4];
-        const dt = f[12];
-
-        if (dt && !current.order.testDate && dt.length >= 14) {
-          current.order.testDate =
-            `${dt.slice(0,4)}-${dt.slice(4,6)}-${dt.slice(6,8)} ` +
-            `${dt.slice(8,10)}:${dt.slice(10,12)}:${dt.slice(12,14)}`;
-        }
-
-        if(test && f[3]) {
-          lastResult = {
-            name: test,
-            value: f[3],
-            unit: f[4],
-            flag: f[6] || 'N',
-            comments: []
-          };
-          current.results.push(lastResult);
-        }
-        break;
-
-      /* ================= COMMENT ================= */
-      case 'C':
-        const comment = f[3]?.trim();
-        if (!comment) break;
-
-        // Attach comment to LAST RESULT if exists
-        if (lastResult) {
-          lastResult.comments.push(comment);
-        } 
-        // Otherwise attach to ORDER
-        else {
-          current.order.comments =
-            current.order.comments || [];
-          current.order.comments.push(comment);
-        }
-        break;
-
-      /* ================= TERMINATOR ================= */
-      case 'L':
-        messages.push(current);
-        current = template();
-        lastResult = null;
-        break;
-
-      /* ================= HOST -> IPU Query ========== */
-      case 'Q':
-		current.query = {sampleId: f[2]?.replace(/\^/g, '').trim()};
-		break;
+    /* Secondary delivery: queueFn (db fallback in server.d.js) */
+    if (typeof queueFn == 'function') {
+      queueFn(name, lines);
     }
   }
 
-  return messages;
+  /* ── Main data handler ── */
+  socket.on('data', function(data) {
+    try {
+      var raw = data.toString('binary');
+      if (logStream) logStream.write(data);
+      tcpBuf += raw;
+
+      /* ═══════════════════════════════════════════════
+         PROCESSING ORDER (critical for correctness):
+           1. ACK / NAK  — responses from device to our outbound
+           2. ENQ        — device requests permission to send
+           3. STX frames — extract raw text, validate checksum, accumulate
+           4. EOT        — finalize current transmission batch
+         ═══════════════════════════════════════════════ */
+
+      /* Phase 1: Consume ACK/NAK (device responses to our outbound frames) */
+      while (tcpBuf.indexOf(CTRL.ACK) !== -1) tcpBuf = tcpBuf.replace(CTRL.ACK, '');
+      while (tcpBuf.indexOf(CTRL.NAK) !== -1) tcpBuf = tcpBuf.replace(CTRL.NAK, '');
+
+      /* Phase 2: ENQ → reply ACK */
+      while (tcpBuf.indexOf(CTRL.ENQ) !== -1) {
+        tcpBuf = tcpBuf.replace(CTRL.ENQ, '');
+        socket.write(CTRL.ACK);
+      }
+
+      /* Phase 3: Extract STX…ETX/ETB frames, validate, accumulate raw records */
+      while (true) {
+        var stxPos = tcpBuf.indexOf(CTRL.STX);
+        if (stxPos === -1) break;
+
+        if (stxPos > 0) {
+          /* Check if EOT is in the gap → end of previous transmission */
+          var gap = tcpBuf.substring(0, stxPos);
+          if (gap.indexOf(CTRL.EOT) !== -1) {
+            tcpBuf = tcpBuf.replace(CTRL.EOT, '');
+            flushTransmission();
+            continue;
+          }
+          /* Non-protocol bytes before STX — skip them */
+          console.warn('[' + name + '] Skipping ' + stxPos + ' byte(s) before STX');
+          tcpBuf = tcpBuf.substring(stxPos);
+        }
+
+        /* Find matching ETX or ETB */
+        var etxIdx = tcpBuf.indexOf(CTRL.ETX, stxPos + 1);
+        var etbIdx = tcpBuf.indexOf(CTRL.ETB, stxPos + 1);
+        var termIdx = -1;
+        if (etxIdx !== -1) termIdx = etxIdx;
+        else if (etbIdx !== -1) termIdx = etbIdx;
+        if (termIdx === -1) break;  /* incomplete frame — wait for more data */
+
+        /* Body = everything between STX and terminator */
+        var body = tcpBuf.substring(stxPos + 1, termIdx);
+        if (!body.length) {
+          tcpBuf = tcpBuf.substring(termIdx + 1);
+          continue;
+        }
+
+        /* ── Checksum detection ──
+           After ETX/ETB: 2 hex bytes + CR = real checksum.
+           After those 3 bytes, another optional CR may follow.
+           If the hex+CR pattern doesn't match, treat as no checksum
+           (device may omit it in some configurations). */
+        var hasChecksum = false;
+        var checksum = '';
+        var consumeEnd = termIdx + 1;
+
+        if (termIdx + 3 < tcpBuf.length) {
+          var b1 = tcpBuf.charCodeAt(termIdx + 1);
+          var b2 = tcpBuf.charCodeAt(termIdx + 2);
+          var b3 = tcpBuf.charCodeAt(termIdx + 3);
+          if (isHexByte(b1) && isHexByte(b2) && b3 === 0x0D) {
+            hasChecksum = true;
+            checksum = tcpBuf.substring(termIdx + 1, termIdx + 3).toUpperCase();
+            consumeEnd = termIdx + 3; /* past ETX + 2 checksum bytes (CR consumed below) */
+          }
+        }
+
+        /* Skip trailing CR after checksum or after terminator */
+        if (consumeEnd < tcpBuf.length && tcpBuf.charCodeAt(consumeEnd) === 0x0D) {
+          consumeEnd++;
+        }
+
+        /* ── Optional frame number ──
+           Sysmex always sends frame number (1-7) as first char of body.
+           If missing or invalid, default to 1 and treat entire body as payload. */
+        var frameNo = 1;
+        var payload = body;
+        var ASTM_TYPES = 'HPOQRCLMS';
+        if (body.length >= 2
+            && body.charCodeAt(0) >= 0x31 && body.charCodeAt(0) <= 0x37
+            && ASTM_TYPES.indexOf(body[1]) !== -1) {
+          frameNo = body.charCodeAt(0) - 0x30;
+          payload = body.substring(1);
+        }
+
+        /* ── Checksum validation (warn only, never drop data) ──
+           Compute over the raw body (between STX and ETX), which includes
+           the frame number digit — matching how the device computes it. */
+        if (hasChecksum) {
+          var csExpected = calcChecksum(body);
+          if (checksum !== csExpected) {
+            console.warn('[' + name + '] CHECKSUM MISMATCH exp=' + csExpected + ' got=' + checksum +
+              ' — accepting data anyway (frame ' + frameNo + ')');
+          }
+        }
+
+        /* ── Frame sequence check (warn only, never drop data) ── */
+        if (frameNo !== expectedFrame) {
+          console.warn('[' + name + '] FRAME SEQ exp=' + expectedFrame + ' got=' + frameNo +
+            ' — accepting data anyway');
+        }
+
+        /* ── Split body on CR to get individual record lines ── */
+        var lines = payload.split('\r');
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].length > 0) {
+            records.push(lines[i]);
+          }
+        }
+
+        /* Remove processed frame from buffer */
+        tcpBuf = tcpBuf.substring(consumeEnd);
+
+        expectedFrame = nextFrame(expectedFrame);
+
+        /* ACK every frame */
+        socket.write(CTRL.ACK);
+      }
+
+      /* Phase 4: Trailing EOT → finalize */
+      if (tcpBuf.indexOf(CTRL.EOT) !== -1) {
+        tcpBuf = tcpBuf.replace(CTRL.EOT, '');
+        flushTransmission();
+      }
+
+    } catch(err) {
+      console.error('[' + name + '] DATA ERROR', err.message, 'from:', socket.remoteAddress);
+      /* Don't NAK — device is unidirectional, won't resend. Just log. */
+    }
+  });
+
+  socket.on('error', function(err) {
+    console.error('[' + name + '] SOCKET ERROR', err.message, 'from:', socket.remoteAddress);
+    exports.monitor.error(name, {
+      type: 'SOCKET_ERROR', message: err.message, ts: Date.now()
+    });
+  });
+
+  socket.on('timeout', function() {
+    console.error('[' + name + '] SOCKET Timeout', socket.remoteAddress);
+    socket.end();
+  });
+
+  socket.on('close', function() {
+    exports.monitor.status(name, { event: 'DISCONNECTED', ts: Date.now() });
+    console.log('[' + name + '] Connection closed');
+    if (logStream) logStream.end();
+  });
 }
