@@ -6,12 +6,19 @@
  * Unidirectional: device sends results, LIS delivers raw text to ERP.
  * No parsing, no CPU-heavy processing.
  *
- * Sysmex frame format (WITH checksum, unlike Maglumi X3):
+ * Frame format (with checksum, unlike Maglumi X3):
  *   ENQ → ACK → <STX>frameNo records<CR>...<CR><ETX>CS<CR> → ACK → EOT
  *
  * Records are CR-separated (0x0D) inside the frame body.
  * Frame number (1-7) is a single leading digit before the first record.
  * Checksum CS is 2 uppercase hex chars after ETX.
+ *
+ * RAW MODE FALLBACK:
+ *   Some Sysmex configurations (or serial-to-TCP bridges) send CR-separated
+ *   ASTM records WITHOUT any STX/ETX/EOT framing. When no STX is detected
+ *   in the stream, the driver auto-switches to raw mode: records are
+ *   accumulated from CR-delimited lines, and transmission boundaries are
+ *   detected via L|1|N terminator or a new H|\^& header.
  */
 
 var net = require('net'), fs = require('fs');
@@ -74,6 +81,7 @@ function handleClient(socket, name, queueFn) {
   var records  = [];    /* accumulated raw record lines for current transmission */
   var logStream = null;
   var expectedFrame = 1;
+  var rawMode = false;  /* auto-detected when no STX framing is present */
 
   /* Persistent binary log (append-only, non-blocking) */
   try {
@@ -103,7 +111,7 @@ function handleClient(socket, name, queueFn) {
     });
 
     /* Secondary delivery: queueFn (db fallback in server.d.js) */
-    if (typeof queueFn == 'function') {
+    if (typeof queueFn === 'function') {
       queueFn(name, lines);
     }
   }
@@ -133,6 +141,43 @@ function handleClient(socket, name, queueFn) {
         socket.write(CTRL.ACK);
       }
 
+      /* ═════════════════════════════════════════════════════
+         Phase 2.5: RAW MODE — unframed ASTM text (no STX/ETX/EOT)
+         Some Sysmex configs or serial-TCP bridges strip framing bytes.
+         CR-separated ASTM records arrive directly; use L|1|N as EOT.
+         ═════════════════════════════════════════════════════ */
+      if (!rawMode && tcpBuf.length > 0 && tcpBuf.indexOf(CTRL.STX) === -1) {
+        var peek = tcpBuf.replace(/^\r+/, '');
+        if (peek.length > 1 && 'HPOQRCLMS'.indexOf(peek[0]) !== -1 && peek[1] === '|') {
+          rawMode = true;
+          console.log('[' + name + '] RAW MODE: no STX framing detected — processing CR-delimited records directly');
+        }
+      }
+
+      if (rawMode) {
+        /* Process complete CR-terminated lines; keep incomplete tail in tcpBuf */
+        var lastCR = tcpBuf.lastIndexOf('\r');
+        if (lastCR !== -1) {
+          var processable = tcpBuf.substring(0, lastCR);
+          tcpBuf = tcpBuf.substring(lastCR + 1);
+          var rawLines = processable.split('\r');
+          for (var ri = 0; ri < rawLines.length; ri++) {
+            var rline = rawLines[ri];
+            if (!rline.length) continue;
+            /* New H|\^& header while records are pending → flush previous transmission */
+            if (rline.indexOf('H|\\^&') === 0 && records.length > 0) {
+              flushTransmission();
+            }
+            records.push(rline);
+            /* L|1|N is the ASTM terminator → flush (equivalent to EOT) */
+            if (rline === 'L|1|N') {
+              flushTransmission();
+            }
+          }
+        }
+        /* If no CR in buffer, data is incomplete — wait for more TCP data */
+      } else {
+
       /* Phase 3: Extract STX…ETX/ETB frames, validate, accumulate raw records */
       while (true) {
         var stxPos = tcpBuf.indexOf(CTRL.STX);
@@ -155,8 +200,15 @@ function handleClient(socket, name, queueFn) {
         var etxIdx = tcpBuf.indexOf(CTRL.ETX, stxPos + 1);
         var etbIdx = tcpBuf.indexOf(CTRL.ETB, stxPos + 1);
         var termIdx = -1;
-        if (etxIdx !== -1) termIdx = etxIdx;
-        else if (etbIdx !== -1) termIdx = etbIdx;
+        /* Pick the NEAREST terminator — critical when multiple frames are
+           buffered simultaneously (ETB continuation + ETX final in same chunk) */
+        if (etxIdx !== -1 && etbIdx !== -1) {
+          termIdx = etxIdx < etbIdx ? etxIdx : etbIdx;
+        } else if (etxIdx !== -1) {
+          termIdx = etxIdx;
+        } else if (etbIdx !== -1) {
+          termIdx = etbIdx;
+        }
         if (termIdx === -1) break;  /* incomplete frame — wait for more data */
 
         /* Body = everything between STX and terminator */
@@ -226,6 +278,10 @@ function handleClient(socket, name, queueFn) {
         for (var i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
             records.push(lines[i]);
+            /* L|1|N terminator → flush patient immediately */
+            if (lines[i] === 'L|1|N') {
+              flushTransmission();
+            }
           }
         }
 
@@ -238,7 +294,9 @@ function handleClient(socket, name, queueFn) {
         socket.write(CTRL.ACK);
       }
 
-      /* Phase 4: Trailing EOT → finalize */
+      } /* end else: framed mode */
+
+      /* Phase 4: Trailing EOT → finalize (applies to both framed and raw mode) */
       if (tcpBuf.indexOf(CTRL.EOT) !== -1) {
         tcpBuf = tcpBuf.replace(CTRL.EOT, '');
         flushTransmission();
