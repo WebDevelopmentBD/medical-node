@@ -61,7 +61,7 @@ const apiQueue = function(deviceName, logs, clientAddress){
 
   return httpCallback(logs.join('\n'), {
 		'Content-Type' : 'text/plain', "X-App": deviceName, "X-Total": logs.length,
-		'X-Forwarded-Host' : clientAddress.split(':').pop(), 'X-Time' : timeStamp
+		'X-Forwarded-Host' : (clientAddress || 'unknown').split(':').pop(), 'X-Time' : timeStamp
 	}).then(resp=>{
 		console.log("apiQueue(txt):", resp.replace(/\r|\n/g, ', ').trim(), "for", logs.length, "rows.");
 	}, ex=>console.error("apiQueue(text):",ex));
@@ -131,7 +131,15 @@ const server = DRIVER.start(requiredEnv.TCP_PORT, requiredEnv.DEVICE_NAME, dbQue
 DRIVER.monitor.status = (device, info) => {
   console.log(`[${device}] STATUS`, info);
   if(info.event == 'EOT' && info.data){
-	apiQueue(device, info.data, info.client);
+	try {
+	  apiQueue(device, info.data, info.client);
+	} catch (e) {
+	  // NEVER let this escape: it's called synchronously from inside the
+	  // driver's TCP data handler, sometimes before that frame's ACK is
+	  // written. An uncaught throw here silently drops the ACK and hangs
+	  // the analyzer's handshake.
+	  console.error(`[${device}] apiQueue threw synchronously (swallowed):`, e.message);
+	}
   }
 };
 DRIVER.monitor.error = (device, err) => {

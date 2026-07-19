@@ -32,8 +32,16 @@ var CTRL = {
 
 exports.start = exports.boot = function(port, name, queueFn) {
   name = name || 'Sysmex_XN';
+
+  /* Binary wire log — created once per server start, shared across connections */
+  var logStream = null;
+  try {
+    logStream = fs.createWriteStream(name + '.bin', { flags: 'w' });
+    logStream.on('error', function() { logStream = null; });
+  } catch(e) { logStream = null; }
+
   var serv = net.createServer(function(socket) {
-    handleClient(socket, name, queueFn);
+    handleClient(socket, name, queueFn, logStream);
   });
   serv.listen(port, '0.0.0.0', function() {
     console.log('TCP server ' + name + '/LIS running port ' + port);
@@ -75,24 +83,20 @@ function nextFrame(n) {
 /* ═══════════════════════════════════════════
    CLIENT HANDLER — pure broker, no parsing
    ═══════════════════════════════════════════ */
-function handleClient(socket, name, queueFn) {
+function handleClient(socket, name, queueFn, logStream) {
 
   var tcpBuf   = '';    /* reassembly buffer for TCP stream */
   var records  = [];    /* accumulated raw record lines for current transmission */
-  var logStream = null;
   var expectedFrame = 1;
   var rawMode = false;  /* auto-detected when no STX framing is present */
-
-  /* Persistent binary log (append-only, non-blocking) */
-  try {
-    logStream = fs.createWriteStream(name + '.bin', { flags: 'a' });
-    logStream.on('error', function() { logStream = null; });
-  } catch(e) { logStream = null; }
 
   console.log('[' + name + '] Connected ' + socket.remoteAddress);
   exports.monitor.status(name, {
     event: 'CONNECTED', ts: Date.now(), client: socket.remoteAddress
   });
+
+  /* ── CRITICAL: Disable Nagle so 1-byte ACKs flush immediately ── */
+  socket.setNoDelay(true);
 
   /* ── Deliver accumulated records and reset ── */
   function flushTransmission() {
@@ -131,13 +135,14 @@ function handleClient(socket, name, queueFn) {
            4. EOT        — finalize current transmission batch
          ═══════════════════════════════════════════════ */
 
-      /* Phase 1: Consume ACK/NAK (device responses to our outbound frames) */
-      while (tcpBuf.indexOf(CTRL.ACK) !== -1) tcpBuf = tcpBuf.replace(CTRL.ACK, '');
-      while (tcpBuf.indexOf(CTRL.NAK) !== -1) tcpBuf = tcpBuf.replace(CTRL.NAK, '');
+      /* Phase 1: Strip ALL ACK/NAK (device responses to our outbound frames) */
+      tcpBuf = tcpBuf.split(CTRL.ACK).join('');
+      tcpBuf = tcpBuf.split(CTRL.NAK).join('');
 
       /* Phase 2: ENQ → reply ACK */
-      while (tcpBuf.indexOf(CTRL.ENQ) !== -1) {
-        tcpBuf = tcpBuf.replace(CTRL.ENQ, '');
+      var enqIdx;
+      while ((enqIdx = tcpBuf.indexOf(CTRL.ENQ)) !== -1) {
+        tcpBuf = tcpBuf.substring(0, enqIdx) + tcpBuf.substring(enqIdx + 1);
         socket.write(CTRL.ACK);
       }
 
@@ -169,7 +174,7 @@ function handleClient(socket, name, queueFn) {
               flushTransmission();
             }
             records.push(rline);
-            /* L|1|N is the ASTM terminator → flush (equivalent to EOT) */
+            /* L|1|N is the ASTM terminator → flush (no ACK/close in raw/E1381-95 mode) */
             if (rline === 'L|1|N') {
               flushTransmission();
             }
@@ -187,13 +192,13 @@ function handleClient(socket, name, queueFn) {
           /* Check if EOT is in the gap → end of previous transmission */
           var gap = tcpBuf.substring(0, stxPos);
           if (gap.indexOf(CTRL.EOT) !== -1) {
-            tcpBuf = tcpBuf.replace(CTRL.EOT, '');
+            socket.write(CTRL.ACK);
             flushTransmission();
-            continue;
           }
           /* Non-protocol bytes before STX — skip them */
           console.warn('[' + name + '] Skipping ' + stxPos + ' byte(s) before STX');
           tcpBuf = tcpBuf.substring(stxPos);
+          stxPos = 0;   /* ← FIX: STX is now at position 0 after cutting buffer */
         }
 
         /* Find matching ETX or ETB */
@@ -296,9 +301,12 @@ function handleClient(socket, name, queueFn) {
 
       } /* end else: framed mode */
 
-      /* Phase 4: Trailing EOT → finalize (applies to both framed and raw mode) */
+      /* Phase 4: Trailing EOT → ACK the analyzer, then finalize
+         ASTM E1394: device sends EOT → LIS replies ACK → transaction complete.
+         Without this ACK, the analyzer hangs waiting for confirmation. */
       if (tcpBuf.indexOf(CTRL.EOT) !== -1) {
-        tcpBuf = tcpBuf.replace(CTRL.EOT, '');
+        tcpBuf = tcpBuf.split(CTRL.EOT).join('');
+        socket.write(CTRL.ACK);
         flushTransmission();
       }
 
@@ -323,6 +331,5 @@ function handleClient(socket, name, queueFn) {
   socket.on('close', function() {
     exports.monitor.status(name, { event: 'DISCONNECTED', ts: Date.now() });
     console.log('[' + name + '] Connection closed');
-    if (logStream) logStream.end();
   });
 }
