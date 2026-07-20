@@ -72,7 +72,7 @@ function handleClient(socket, name, queueFn) {
   } catch(e) { logStream = null; }
 
   socket.setNoDelay(true);
-  socket.setTimeout(15000);
+  socket.setTimeout(0);
 
   exports.monitor.status(name, {
     event: 'CONNECTED', ts: Date.now(), client: socket.remoteAddress
@@ -169,9 +169,7 @@ function handleClient(socket, name, queueFn) {
     }
   });
 
-  socket.on('timeout', function() {
-    console.warn('[' + name + '] Timeout ' + socket.remoteAddress);
-  });
+
 
   socket.on('error', function(err) {
     console.error('[' + name + '] SOCKET ERROR', err.message);
