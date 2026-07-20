@@ -144,26 +144,11 @@ function handleClient(socket, name, queueFn) {
           continue;
         }
 
-        /* Body = FN + DATA (between STX and ETX/ETB) */
+        /* Body = FN + DATA (between STX and ETX/ETB), skip CS(2) */
         var body = tcpBuf.substring(stx + 1, tPos);
-        var cs   = tcpBuf.substring(tPos + 1, tPos + 3);
-
-        /* Checksum: sum FN..ETX/ETB, mod 256 (per manual example §3.1.4) */
-        var sum = 0;
-        for (var i = 0; i <= body.length; i++) {
-          sum += (i < body.length ? body.charCodeAt(i) : tChr.charCodeAt(0)) & 0xFF;
-        }
-        var ok = sum & 0xFF;
-        var exp = (ok < 16 ? '0' : '') + ok.toString(16).toUpperCase();
 
         /* Consume the full frame from buffer */
         tcpBuf = tcpBuf.substring(end);
-
-        if (exp !== cs.toUpperCase()) {
-          console.warn('[' + name + '] CS fail exp=' + exp + ' got=' + cs);
-          socket.write(CTRL.NAK);
-          continue;
-        }
 
         /* Strip FN (first char '0'-'7') and trailing CR */
         var rec = body;
