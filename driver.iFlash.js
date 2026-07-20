@@ -148,12 +148,12 @@ function handleClient(socket, name, queueFn) {
         var body = tcpBuf.substring(stx + 1, tPos);
         var cs   = tcpBuf.substring(tPos + 1, tPos + 3);
 
-        /* Checksum: sum FN..ETX/ETB, complement mod 256 */
+        /* Checksum: sum FN..ETX/ETB, mod 256 (per manual example §3.1.4) */
         var sum = 0;
         for (var i = 0; i <= body.length; i++) {
           sum += (i < body.length ? body.charCodeAt(i) : tChr.charCodeAt(0)) & 0xFF;
         }
-        var ok = ((256 - (sum & 0xFF)) & 0xFF);
+        var ok = sum & 0xFF;
         var exp = (ok < 16 ? '0' : '') + ok.toString(16).toUpperCase();
 
         /* Consume the full frame from buffer */
